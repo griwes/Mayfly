@@ -28,10 +28,7 @@
 #include <chrono>
 
 #include <boost/process.hpp>
-#include <boost/process/initializers.hpp>
 #include <boost/program_options.hpp>
-#include <boost/iostreams/device/file_descriptor.hpp>
-#include <boost/iostreams/stream.hpp>
 #include <boost/algorithm/string.hpp>
 #include <boost/range/algorithm/search.hpp>
 #include <boost/optional.hpp>
@@ -85,6 +82,7 @@ namespace reaver
             std::atomic<std::uintmax_t> _tests{};
             std::atomic<std::uintmax_t> _passed{};
 
+            mutable std::mutex _failed_mtx;
             std::vector<std::pair<testcase_status, std::string>> _failed;
             std::chrono::milliseconds _last_actual_time{ 0 };
         };
@@ -225,6 +223,7 @@ namespace reaver
 
                             else
                             {
+                                std::lock_guard<std::mutex> lock{ _failed_mtx };
                                 _failed.push_back(std::make_pair(result.status, boost::join(fmap(suite_stack, [](auto && s){ return s.get().name(); }), "/") + "/" + test.name()));
                             }
                         };
@@ -260,48 +259,26 @@ namespace reaver
                     rep.test_started(t);
                 }
 
-                using namespace boost::process::initializers;
-
                 std::vector<std::string> args{ _executable, "--test", boost::join(fmap(suite_stack, [](auto && s){ return s.get().name(); }), "/") + "/" + t.name(), "-r", "subprocess" };
 
-                boost::process::pipe p = boost::process::create_pipe();
-                std::atomic<bool> timeout_flag{ false };
-                std::atomic<bool> finished_flag{ false };
-                std::mutex m;
-                std::condition_variable cv;
-                reaver::joining_thread th;
+                boost::process::ipstream out;
 
                 auto begin = std::chrono::high_resolution_clock::now();
+                bool timeout_flag = false;
 
+                boost::process::child child(args, boost::process::std_out > out);
+                std::error_code ec;
+                if (!child.wait_for(std::chrono::seconds{ _timeout }, ec))
                 {
-                    boost::iostreams::file_descriptor_sink sink{ p.sink, boost::iostreams::close_handle };
-
-                    auto child = boost::process::execute(set_args(args), inherit_env(), bind_stdout(sink), close_stdin());
-
-                    th = std::thread{ [&]()
-                    {
-                        std::unique_lock<std::mutex> lock{ m };
-                        if (finished_flag)
-                        {
-                            return;
-                        }
-
-                        if (!cv.wait_for(lock, std::chrono::seconds{ _timeout }, [&]() -> bool { return finished_flag; }))
-                        {
-                            timeout_flag = true;
-                            boost::process::terminate(child);
-                        }
-                    }};
+                    timeout_flag = true;
+                    child.terminate(ec);
                 }
-
-                boost::iostreams::file_descriptor_source source{ p.source, boost::iostreams::close_handle };
-                boost::iostreams::stream<boost::iostreams::file_descriptor_source> is(source);
 
                 std::string message;
 
                 enum { not_started, started, finished, exited } state = not_started;
 
-                while (std::getline(is, message))
+                while (std::getline(out, message))
                 {
                     if (message.substr(0, 2) == "{{")
                     {
@@ -358,17 +335,6 @@ namespace reaver
                     {
                         result.status = testcase_status::crashed;
                     }
-                }
-
-                try
-                {
-                    std::unique_lock<std::mutex> lock{ m };
-                    finished_flag = true;
-                    cv.notify_all();
-                }
-
-                catch (...)
-                {
                 }
 
                 auto duration = std::chrono::high_resolution_clock::now() - begin;
